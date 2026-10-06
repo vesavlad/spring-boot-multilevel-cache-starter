@@ -6,6 +6,12 @@
 
 - Opt-in negative caching via `spring.cache.multilevel.cache-null-values` (default `false`).
   When enabled, `null` results are cached in Caffeine and Redis with the regular TTL.
+- Per-cache overrides via `spring.cache.multilevel.caches.<name>.*` for `time-to-live`,
+  `cache-null-values`, `local.max-size`, `local.time-to-live`, `local.expiry-jitter` and
+  `local.expiration-mode`. Unset fields inherit the global values.
+- `spring.cache.multilevel.circuit-breaker.enabled` (default `true`). When `false`, the breaker
+  is created in the `DISABLED` state: Redis is attempted on every operation and failures still
+  fall back to the local tier.
 
 ### Compatibility
 
@@ -13,6 +19,8 @@
   caching enabled are treated as cache misses instead of failing deserialization.
 - Enable `cache-null-values` only after every instance sharing the Redis keyspace runs a release
   that includes this change; instances on earlier releases may fail to deserialize cached nulls.
+- The circuit-breaker open-state recommendation now uses the effective local TTL (global
+  `local.time-to-live` when set) and is also checked for each overridden cache.
 
 ## 4.1.1.0
 

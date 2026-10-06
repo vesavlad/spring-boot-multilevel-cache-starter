@@ -128,18 +128,69 @@ configured Redis serializer.
 
 ## Configuration options
 
-| Property                                        | Default                  | Notes                                                                                               |
-|-------------------------------------------------|--------------------------|-----------------------------------------------------------------------------------------------------|
-| `spring.cache.multilevel.time-to-live`          | `1h`                     | TTL applied to Redis entries; local cache derives its randomized expiry from here unless overridden |
-| `spring.cache.multilevel.use-key-prefix`        | `false`                  | Enables `key-prefix`; set to `true` only when you supply a non-empty prefix                         |
-| `spring.cache.multilevel.key-prefix`            | `""`                     | Optional Redis key prefix                                                                           |
-| `spring.cache.multilevel.topic`                 | `cache:multilevel:topic` | Redis Pub/Sub channel used to broadcast evictions                                                   |
-| `spring.cache.multilevel.cache-null-values`     | `false`                  | Caches `null` results in both tiers; see the rollout note under "Cache behavior"                    |
-| `spring.cache.multilevel.local.max-size`        | `2000`                   | Maximum number of entries retained in Caffeine                                                      |
-| `spring.cache.multilevel.local.expiry-jitter`   | `50`                     | Percentage used to randomize the local TTL                                                          |
-| `spring.cache.multilevel.local.expiration-mode` | `after-create`           | One of `after-create`, `after-update`, `after-read`                                                 |
-| `spring.cache.multilevel.local.time-to-live`    | empty                    | Optional dedicated TTL for the local cache                                                          |
-| `spring.cache.multilevel.circuit-breaker.*`     | see YAML                 | Passed directly to Resilience4j’s circuit breaker builder                                           |
+| Property                                                      | Default                  | Notes                                                                                               |
+|---------------------------------------------------------------|--------------------------|-----------------------------------------------------------------------------------------------------|
+| `spring.cache.multilevel.time-to-live`                        | `1h`                     | TTL applied to Redis entries; local cache derives its randomized expiry from here unless overridden |
+| `spring.cache.multilevel.use-key-prefix`                      | `false`                  | Enables `key-prefix`; set to `true` only when you supply a non-empty prefix                         |
+| `spring.cache.multilevel.key-prefix`                          | `""`                     | Optional Redis key prefix                                                                           |
+| `spring.cache.multilevel.topic`                               | `cache:multilevel:topic` | Redis Pub/Sub channel used to broadcast evictions                                                   |
+| `spring.cache.multilevel.cache-null-values`                   | `false`                  | Caches `null` results in both tiers; see the rollout note under "Cache behavior"                    |
+| `spring.cache.multilevel.local.max-size`                      | `2000`                   | Maximum number of entries retained in Caffeine                                                      |
+| `spring.cache.multilevel.local.expiry-jitter`                 | `50`                     | Percentage used to randomize the local TTL                                                          |
+| `spring.cache.multilevel.local.expiration-mode`               | `after-create`           | One of `after-create`, `after-update`, `after-read`                                                 |
+| `spring.cache.multilevel.local.time-to-live`                  | empty                    | Optional dedicated TTL for the local cache                                                          |
+| `spring.cache.multilevel.caches.<name>.time-to-live`          | global value             | Redis TTL for cache `<name>`; see "Per-cache overrides"                                             |
+| `spring.cache.multilevel.caches.<name>.cache-null-values`     | global value             | Null caching for cache `<name>`                                                                     |
+| `spring.cache.multilevel.caches.<name>.local.max-size`        | global value             | Caffeine maximum size for cache `<name>`                                                            |
+| `spring.cache.multilevel.caches.<name>.local.time-to-live`    | see below                | Local TTL for cache `<name>`                                                                        |
+| `spring.cache.multilevel.caches.<name>.local.expiry-jitter`   | global value             | Local expiry jitter for cache `<name>`                                                              |
+| `spring.cache.multilevel.caches.<name>.local.expiration-mode` | global value             | Local expiration mode for cache `<name>`                                                            |
+| `spring.cache.multilevel.circuit-breaker.enabled`             | `true`                   | `false` keeps the breaker permanently closed; see note below                                        |
+| `spring.cache.multilevel.circuit-breaker.*`                   | see YAML                 | Passed directly to Resilience4j’s circuit breaker builder                                           |
+
+With `circuit-breaker.enabled: false` the breaker never opens. Redis outages are still tolerated:
+each cache operation tries Redis, and after that call fails it falls back to the local tier. The
+difference is that every operation waits for the Redis client timeout during an outage instead of
+skipping Redis immediately, so size the client timeout accordingly.
+
+### Per-cache overrides
+
+Each cache can override `time-to-live`, `cache-null-values` and the `local.*` settings under
+`spring.cache.multilevel.caches.<name>`. Anything not set inherits the global value. `key-prefix`,
+`topic` and `circuit-breaker` are always global.
+
+```yaml
+spring:
+  cache:
+    type: redis
+    multilevel:
+      time-to-live: 1h
+      local:
+        max-size: 2000
+      caches:
+        products:
+          time-to-live: 60m
+          local:
+            max-size: 5000
+            time-to-live: 5m
+            expiry-jitter: 5
+        sourceNodes:
+          time-to-live: 30m
+          cache-null-values: true
+          local:
+            max-size: 100
+```
+
+- A cache's local TTL is the first value set among `caches.<name>.local.time-to-live`, the global
+  `local.time-to-live`, and the cache's own `time-to-live`.
+- Overrides do not create caches. When `spring.cache.cache-names` is set, an override for a name not
+  in that list never applies and is logged as a warning at startup.
+- Every override that can apply is validated at startup; an invalid value (for example
+  `local.expiry-jitter: 150`) fails with `Invalid configuration for cache '<name>': ...`.
+- Cache names are matched exactly. YAML keys keep their case (`sourceNodes`); names with dots or
+  other special characters need brackets (`"[user.byId]"`). Keys set through environment variables
+  are lowercased by Spring Boot (`SPRING_CACHE_MULTILEVEL_CACHES_SOURCENODES_TIMETOLIVE` configures
+  `sourcenodes`), so use YAML or properties files for camelCase names.
 
 ## Default configuration
 
@@ -168,6 +219,7 @@ spring:
         # other valid values for expiration-mode: after-update, after-read
       # Resilience4j Circuit Breaker properties for Redis
       circuit-breaker:
+        enabled: true
         failure-rate-threshold: 25
         slow-call-rate-threshold: 25
         slow-call-duration-threshold: 250ms

@@ -26,9 +26,12 @@ package io.github.suppie.spring.cache;
 
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig.SlidingWindowType;
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import lombok.Data;
+import org.jspecify.annotations.Nullable;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.NestedConfigurationProperty;
 import org.springframework.data.redis.cache.RedisCacheConfiguration;
@@ -65,6 +68,13 @@ public class MultiLevelCacheConfigurationProperties {
   private CircuitBreakerProperties circuitBreaker = new CircuitBreakerProperties();
 
   /**
+   * Per-cache overrides keyed by cache name. Fields left unset inherit the global value. Names
+   * containing dots or other special characters must use bracket notation, e.g. {@code
+   * "[user.byId]"}.
+   */
+  private Map<String, CacheOverrideProperties> caches = new LinkedHashMap<>();
+
+  /**
    * Builds the Redis cache configuration represented by these properties.
    *
    * @return configuration for Redis entries, TTL, and key prefixing
@@ -85,6 +95,51 @@ public class MultiLevelCacheConfigurationProperties {
     return configuration;
   }
 
+  /**
+   * Resolves the effective settings for one cache by applying its override, if any, to the global
+   * settings. The global instance is never modified.
+   *
+   * @param cacheName cache name to resolve
+   * @return this instance when the cache has no override, otherwise a resolved copy without
+   *     per-cache overrides
+   */
+  public MultiLevelCacheConfigurationProperties forCache(String cacheName) {
+    CacheOverrideProperties override = caches.get(cacheName);
+    if (override == null) {
+      return this;
+    }
+
+    MultiLevelCacheConfigurationProperties resolved = new MultiLevelCacheConfigurationProperties();
+    resolved.setTimeToLive(Objects.requireNonNullElse(override.getTimeToLive(), timeToLive));
+    resolved.setKeyPrefix(keyPrefix);
+    resolved.setUseKeyPrefix(useKeyPrefix);
+    resolved.setTopic(topic);
+    resolved.setCacheNullValues(
+        Objects.requireNonNullElse(override.getCacheNullValues(), cacheNullValues));
+    resolved.setCircuitBreaker(circuitBreaker);
+
+    LocalCacheOverrideProperties localOverride = override.getLocal();
+    LocalCacheProperties resolvedLocal = resolved.getLocal();
+    resolvedLocal.setMaxSize(
+        Objects.requireNonNullElse(localOverride.getMaxSize(), local.getMaxSize()));
+    resolvedLocal.setTimeToLive(
+        Optional.ofNullable(localOverride.getTimeToLive()).or(local::getTimeToLive));
+    resolvedLocal.setExpiryJitter(
+        Objects.requireNonNullElse(localOverride.getExpiryJitter(), local.getExpiryJitter()));
+    resolvedLocal.setExpirationMode(
+        Objects.requireNonNullElse(localOverride.getExpirationMode(), local.getExpirationMode()));
+    return resolved;
+  }
+
+  /**
+   * Returns the TTL that drives local expiry: the local TTL when set, otherwise the Redis TTL.
+   *
+   * @return effective local time to live
+   */
+  public Duration effectiveLocalTimeToLive() {
+    return local.getTimeToLive().orElse(timeToLive);
+  }
+
   /** Local cache settings for size limits and expiration strategy. */
   @Data
   public static class LocalCacheProperties {
@@ -100,6 +155,38 @@ public class MultiLevelCacheConfigurationProperties {
 
     /** Event that resets local expiration; defaults to creation for compatibility. */
     private LocalExpirationMode expirationMode = LocalExpirationMode.AFTER_CREATE;
+  }
+
+  /** Settings a single cache may override; {@code null} fields inherit the global value. */
+  @Data
+  public static class CacheOverrideProperties {
+
+    /** Time to live for this cache's Redis entries. */
+    private @Nullable Duration timeToLive;
+
+    /** Whether this cache stores {@code null} results in both tiers. */
+    private @Nullable Boolean cacheNullValues;
+
+    /** Local Caffeine overrides for this cache. */
+    @NestedConfigurationProperty
+    private LocalCacheOverrideProperties local = new LocalCacheOverrideProperties();
+  }
+
+  /** Local cache settings a single cache may override; {@code null} fields inherit. */
+  @Data
+  public static class LocalCacheOverrideProperties {
+
+    /** Maximum number of entries to store in this cache's local tier. */
+    private @Nullable Integer maxSize;
+
+    /** Local TTL for this cache. */
+    private @Nullable Duration timeToLive;
+
+    /** Percentage of randomized deviation applied to this cache's local expiration. */
+    private @Nullable Integer expiryJitter;
+
+    /** Event that resets local expiration for this cache. */
+    private @Nullable LocalExpirationMode expirationMode;
   }
 
   /**
@@ -130,6 +217,12 @@ public class MultiLevelCacheConfigurationProperties {
    */
   @Data
   public static class CircuitBreakerProperties {
+
+    /**
+     * Whether the breaker may open. When disabled every cache operation still tries Redis and falls
+     * back to the local tier only after that call fails.
+     */
+    private boolean enabled = true;
 
     /** Percentage of failed calls required to open the breaker. */
     private int failureRateThreshold = 25;

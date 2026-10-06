@@ -25,6 +25,7 @@
 package io.github.suppie.spring.cache;
 
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.suppie.spring.cache.MultiLevelCacheConfigurationProperties.CacheOverrideProperties;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -346,6 +347,52 @@ class MultiLevelCacheTestcontainersTest extends AbstractRedisIntegrationTest {
           "loaded", disabled.get(key, () -> "loaded"), "Loader must run over a null marker");
     } finally {
       enabled.evict(key);
+    }
+  }
+
+  @Test
+  void perCacheNullCachingOverrideAppliesOnlyToThatCache() {
+    final String key = "perCacheNullCachingOverride";
+    MultiLevelCacheConfigurationProperties properties = nullCachingProperties(false);
+    CacheOverrideProperties override = new CacheOverrideProperties();
+    override.setCacheNullValues(true);
+    properties.getCaches().put("perCacheNullsEnabled", override);
+    MultiLevelCacheManager manager =
+        new MultiLevelCacheManager(
+            cachePropertiesProvider, properties, multiLevelCacheRedisTemplate, circuitBreaker);
+    MultiLevelCache enabled = (MultiLevelCache) manager.getCache("perCacheNullsEnabled");
+    MultiLevelCache disabled = (MultiLevelCache) manager.getCache("perCacheNullsDisabled");
+    Assertions.assertNotNull(enabled);
+    Assertions.assertNotNull(disabled);
+    AtomicInteger loads = new AtomicInteger();
+
+    try {
+      Assertions.assertNull(
+          enabled.get(
+              key,
+              () -> {
+                loads.incrementAndGet();
+                return null;
+              }));
+      Assertions.assertNull(
+          enabled.get(
+              key,
+              () -> {
+                loads.incrementAndGet();
+                return null;
+              }));
+      Assertions.assertEquals(1, loads.get(), "Cached null must short-circuit the loader");
+      Cache.ValueWrapper wrapper = enabled.get(key);
+      Assertions.assertNotNull(wrapper, "Cached null must be a hit");
+      Assertions.assertNull(wrapper.get(), "Cached null must surface as null");
+
+      Assertions.assertThrows(
+          Cache.ValueRetrievalException.class,
+          () -> disabled.get(key, () -> null),
+          "Cache without the override keeps the no-null contract");
+    } finally {
+      enabled.evict(key);
+      disabled.evict(key);
     }
   }
 

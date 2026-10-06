@@ -15,6 +15,13 @@ spring:
         max-size: 2000
         expiry-jitter: 40
         time-to-live: 30s
+      caches:
+        products:
+          time-to-live: 5m
+          local:
+            max-size: 500
+            time-to-live: 1m
+            expiry-jitter: 10
   data:
     redis:
       host: ${REDIS_HOST:localhost}

@@ -86,6 +86,8 @@ public class MultiLevelCacheManager implements CacheManager {
 
     this.availableCaches = new ConcurrentHashMap<>();
 
+    warnAboutUnreachableOverrides();
+    validateReachableOverrides();
     this.requestedCacheNames.forEach(this::getCache);
   }
 
@@ -108,8 +110,8 @@ public class MultiLevelCacheManager implements CacheManager {
    * Gets or creates the cache associated with the given name.
    *
    * @param name the cache identifier (must not be {@code null})
-   * @return the associated cache, or {@code null} when the configured cache-name allowlist excludes
-   *     the name
+   * @return the associated cache built from its resolved per-cache settings, or {@code null} when
+   *     the configured cache-name allowlist excludes the name
    */
   @Override
   public Cache getCache(@NonNull String name) {
@@ -117,19 +119,56 @@ public class MultiLevelCacheManager implements CacheManager {
       return null;
     }
 
-    return availableCaches.computeIfAbsent(
+    return availableCaches.computeIfAbsent(name, this::createCache);
+  }
+
+  /** Creates a cache from its resolved settings. */
+  private Cache createCache(@NonNull String name) {
+    MultiLevelCacheConfigurationProperties cacheProperties = properties.forCache(name);
+    return new MultiLevelCache(
         name,
-        key ->
-            new MultiLevelCache(
-                key,
-                properties,
-                redisTemplate,
-                Caffeine.newBuilder()
-                    .maximumSize(properties.getLocal().getMaxSize())
-                    .expireAfter(new RandomizedLocalExpiry(properties))
-                    .build(),
-                circuitBreaker,
-                instanceId));
+        cacheProperties,
+        redisTemplate,
+        localCacheBuilder(name, cacheProperties).build(),
+        circuitBreaker,
+        instanceId);
+  }
+
+  /** Configures the local tier for one cache, naming the cache when its settings are invalid. */
+  private static Caffeine<Object, Object> localCacheBuilder(
+      @NonNull String name, MultiLevelCacheConfigurationProperties cacheProperties) {
+    try {
+      return Caffeine.newBuilder()
+          .maximumSize(cacheProperties.getLocal().getMaxSize())
+          .expireAfter(new RandomizedLocalExpiry(cacheProperties));
+    } catch (IllegalArgumentException exception) {
+      throw new IllegalArgumentException(
+          "Invalid configuration for cache '" + name + "': " + exception.getMessage(), exception);
+    }
+  }
+
+  /** Fails fast on invalid overrides for caches that may be created later on demand. */
+  private void validateReachableOverrides() {
+    properties.getCaches().keySet().stream()
+        .filter(name -> requestedCacheNames.isEmpty() || requestedCacheNames.contains(name))
+        .forEach(name -> localCacheBuilder(name, properties.forCache(name)));
+  }
+
+  /** Warns about overrides that the configured cache-name allowlist prevents from ever applying. */
+  private void warnAboutUnreachableOverrides() {
+    if (requestedCacheNames.isEmpty()) {
+      return;
+    }
+
+    properties.getCaches().keySet().stream()
+        .filter(name -> !requestedCacheNames.contains(name))
+        .forEach(
+            name ->
+                log.warn(
+                    "Cache override 'spring.cache.multilevel.caches.{}' will never apply because"
+                        + " '{}' is not listed in 'spring.cache.cache-names'",
+                    name,
+                    name));
   }
 
   /**
@@ -163,7 +202,7 @@ public class MultiLevelCacheManager implements CacheManager {
      */
     public RandomizedLocalExpiry(@NonNull MultiLevelCacheConfigurationProperties properties) {
       LocalCacheProperties localProperties = properties.getLocal();
-      this.timeToLive = localProperties.getTimeToLive().orElse(properties.getTimeToLive());
+      this.timeToLive = properties.effectiveLocalTimeToLive();
       this.expiryJitter = localProperties.getExpiryJitter();
       this.expirationMode = localProperties.getExpirationMode();
 

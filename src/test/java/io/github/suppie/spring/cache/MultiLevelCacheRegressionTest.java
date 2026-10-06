@@ -117,6 +117,22 @@ class MultiLevelCacheRegressionTest {
   }
 
   @Test
+  void disabledBreakerKeepsFallingBackToLocalCache() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    writer.failWith(new RedisConnectionFailureException("Redis is unavailable"));
+    CircuitBreaker breaker = breaker("disabled");
+    breaker.transitionToDisabledState();
+    MultiLevelCache cache = cache("cache", writer, RedisSerializer.json(), breaker);
+
+    assertThat(cache.get("first", () -> "fallback-1")).isEqualTo("fallback-1");
+    assertThat(cache.get("second", () -> "fallback-2")).isEqualTo("fallback-2");
+
+    assertThat(breaker.getState()).isEqualTo(CircuitBreaker.State.DISABLED);
+    assertThat(cache.getLocalCache().getIfPresent(cache.toLocalKey("second")))
+        .isEqualTo("fallback-2");
+  }
+
+  @Test
   void availabilityFailureMakesPutIfAbsentStoreLocally() {
     TestRedisCacheWriter writer = new TestRedisCacheWriter();
     writer.failWith(new RedisConnectionFailureException("Redis is unavailable"));

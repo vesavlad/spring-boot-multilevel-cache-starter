@@ -24,16 +24,23 @@
 
 package io.github.suppie.spring.cache;
 
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.suppie.spring.cache.MultiLevelCacheConfigurationProperties.CacheOverrideProperties;
 import io.github.suppie.spring.cache.MultiLevelCacheManager.RandomizedLocalExpiry;
 import java.time.Duration;
 import java.util.Optional;
+import org.jspecify.annotations.NonNull;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.cache.autoconfigure.CacheAutoConfiguration;
+import org.springframework.boot.cache.autoconfigure.CacheProperties;
 import org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.test.context.ActiveProfiles;
 
 @ActiveProfiles("test")
@@ -45,6 +52,15 @@ import org.springframework.test.context.ActiveProfiles;
     })
 class MultiLevelCacheManagerTest extends AbstractRedisIntegrationTest {
   @Autowired MultiLevelCacheManager cacheManager;
+  @Autowired ObjectProvider<@NonNull CacheProperties> cachePropertiesProvider;
+
+  @Autowired
+  @Qualifier(MultiLevelCacheAutoConfiguration.CIRCUIT_BREAKER_NAME)
+  CircuitBreaker circuitBreaker;
+
+  @Autowired
+  @Qualifier(MultiLevelCacheAutoConfiguration.CACHE_REDIS_TEMPLATE_NAME)
+  RedisTemplate<Object, Object> multiLevelCacheRedisTemplate;
 
   @Test
   void cacheNamesTest() {
@@ -56,8 +72,75 @@ class MultiLevelCacheManagerTest extends AbstractRedisIntegrationTest {
         cacheManager.getCacheNames().contains(key), "Cache name must be accessible");
   }
 
+  @Test
+  void cachesReceiveTheirOwnOverrides() {
+    MultiLevelCacheConfigurationProperties properties =
+        new MultiLevelCacheConfigurationProperties();
+    CacheOverrideProperties products = new CacheOverrideProperties();
+    products.setTimeToLive(Duration.ofMinutes(30));
+    products.getLocal().setMaxSize(5000);
+    products.getLocal().setTimeToLive(Duration.ofMinutes(5));
+    properties.getCaches().put("products", products);
+    MultiLevelCacheManager manager = newManager(properties);
+
+    MultiLevelCache productsCache = (MultiLevelCache) manager.getCache("products");
+    MultiLevelCache otherCache = (MultiLevelCache) manager.getCache("other");
+
+    Assertions.assertNotNull(productsCache);
+    Assertions.assertNotNull(otherCache);
+    Assertions.assertEquals(
+        5000L, productsCache.getLocalCache().policy().eviction().orElseThrow().getMaximum());
+    Assertions.assertEquals(
+        2000L, otherCache.getLocalCache().policy().eviction().orElseThrow().getMaximum());
+    Assertions.assertEquals(Duration.ofMinutes(30), productsCache.properties.getTimeToLive());
+    Assertions.assertEquals(
+        Duration.ofMinutes(5), productsCache.properties.effectiveLocalTimeToLive());
+    Assertions.assertEquals(
+        Duration.ofMinutes(30),
+        productsCache.getCacheConfiguration().getTtlFunction().getTimeToLive("k", "v"));
+    Assertions.assertSame(properties, otherCache.properties);
+  }
+
+  @Test
+  void invalidOverrideFailsManagerConstructionNamingTheCache() {
+    MultiLevelCacheConfigurationProperties properties =
+        new MultiLevelCacheConfigurationProperties();
+    CacheOverrideProperties broken = new CacheOverrideProperties();
+    broken.getLocal().setExpiryJitter(150);
+    properties.getCaches().put("broken", broken);
+
+    IllegalArgumentException exception =
+        Assertions.assertThrows(IllegalArgumentException.class, () -> newManager(properties));
+
+    Assertions.assertEquals(
+        "Invalid configuration for cache 'broken': Expiry jitter must not exceed 100 percents",
+        exception.getMessage());
+  }
+
+  private MultiLevelCacheManager newManager(MultiLevelCacheConfigurationProperties properties) {
+    return new MultiLevelCacheManager(
+        cachePropertiesProvider, properties, multiLevelCacheRedisTemplate, circuitBreaker);
+  }
+
   @Nested
   class RandomizedLocalExpiryTest {
+    @Test
+    void expirationUsesResolvedLocalTimeToLiveOfOverride() {
+      MultiLevelCacheConfigurationProperties properties =
+          new MultiLevelCacheConfigurationProperties();
+      CacheOverrideProperties override = new CacheOverrideProperties();
+      override.getLocal().setTimeToLive(Duration.ofSeconds(2));
+      override.getLocal().setExpiryJitter(0);
+      properties.getCaches().put("c", override);
+
+      RandomizedLocalExpiry expiry = new RandomizedLocalExpiry(properties.forCache("c"));
+
+      Assertions.assertEquals(
+          Duration.ofSeconds(1).toNanos(),
+          expiry.expireAfterCreate("key", "value", 0),
+          "Zero jitter must expire at half of the overridden local TTL");
+    }
+
     @Test
     void negativeTimeToLive() {
       MultiLevelCacheConfigurationProperties properties =

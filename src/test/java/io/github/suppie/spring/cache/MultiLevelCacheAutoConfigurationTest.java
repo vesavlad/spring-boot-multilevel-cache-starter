@@ -24,6 +24,7 @@
 
 package io.github.suppie.spring.cache;
 
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import java.util.Arrays;
 import java.util.stream.Stream;
 import org.assertj.core.api.Assertions;
@@ -251,5 +252,152 @@ class MultiLevelCacheAutoConfigurationTest extends AbstractRedisIntegrationTest 
     RedisSerializer<@NonNull Object> legacyCustomValueSerializer() {
       return (RedisSerializer<@NonNull Object>) (RedisSerializer<?>) new StringRedisSerializer();
     }
+  }
+
+  @Test
+  void overrideForCacheOutsideCacheNamesLogsWarning(CapturedOutput output) {
+    runner
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .withPropertyValues("spring.cache.cache-names=products")
+        .withPropertyValues("spring.cache.multilevel.caches.products.local.max-size=5000")
+        .withPropertyValues("spring.cache.multilevel.caches.sourceNodes.local.max-size=100")
+        .run(
+            context -> {
+              MultiLevelCacheManager cacheManager = context.getBean(MultiLevelCacheManager.class);
+              MultiLevelCache products = (MultiLevelCache) cacheManager.getCache("products");
+              Assertions.assertThat(products).isNotNull();
+              Assertions.assertThat(
+                      products.getLocalCache().policy().eviction().orElseThrow().getMaximum())
+                  .isEqualTo(5000L);
+              Assertions.assertThat(cacheManager.getProperties().getCaches())
+                  .containsKey("sourceNodes");
+            });
+
+    Assertions.assertThat(output)
+        .contains(
+            "Cache override 'spring.cache.multilevel.caches.sourceNodes' will never apply because"
+                + " 'sourceNodes' is not listed in 'spring.cache.cache-names'")
+        .doesNotContain("caches.products' will never apply");
+  }
+
+  @Test
+  void overrideWithoutCacheNamesDoesNotWarn(CapturedOutput output) {
+    runner
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .withPropertyValues("spring.cache.multilevel.caches.sourceNodes.local.max-size=100")
+        .run(context -> Assertions.assertThat(context).hasSingleBean(MultiLevelCacheManager.class));
+
+    Assertions.assertThat(output).doesNotContain("will never apply");
+  }
+
+  @Test
+  void invalidOverrideOnEagerCacheFailsStartup() {
+    runner
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .withPropertyValues("spring.cache.cache-names=broken")
+        .withPropertyValues("spring.cache.multilevel.caches.broken.local.expiry-jitter=150")
+        .run(
+            context -> {
+              Assertions.assertThat(context).hasFailed();
+              Assertions.assertThat(context.getStartupFailure())
+                  .hasStackTraceContaining(
+                      "Invalid configuration for cache 'broken': Expiry jitter must not exceed 100"
+                          + " percents");
+            });
+  }
+
+  @Test
+  void circuitBreakerWarnsForCacheWhoseOverrideExpiresTooSoon(CapturedOutput output) {
+    runner
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .withPropertyValues(
+            "spring.cache.multilevel.circuit-breaker.wait-duration-in-open-state=3s")
+        .withPropertyValues("spring.cache.multilevel.caches.prices.local.time-to-live=4s")
+        .withPropertyValues("spring.cache.multilevel.caches.prices.local.expiry-jitter=0")
+        .run(context -> Assertions.assertThat(context).hasSingleBean(MultiLevelCacheManager.class));
+
+    Assertions.assertThat(output)
+        .contains(
+            "Cache circuit breaker wait duration in open state PT3S is more than recommended value"
+                + " of PT2S for cache 'prices'")
+        .doesNotContain("recommended value of PT15M");
+  }
+
+  @Test
+  void invalidOverrideOnLazyCacheFailsStartup() {
+    runner
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .withPropertyValues("spring.cache.multilevel.caches.broken.local.max-size=-1")
+        .run(
+            context -> {
+              Assertions.assertThat(context).hasFailed();
+              Assertions.assertThat(context.getStartupFailure())
+                  .hasStackTraceContaining("Invalid configuration for cache 'broken'");
+            });
+  }
+
+  @Test
+  void invalidOverrideOutsideCacheNamesOnlyWarns(CapturedOutput output) {
+    runner
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .withPropertyValues("spring.cache.cache-names=products")
+        .withPropertyValues("spring.cache.multilevel.caches.broken.local.expiry-jitter=150")
+        .run(context -> Assertions.assertThat(context).hasSingleBean(MultiLevelCacheManager.class));
+
+    Assertions.assertThat(output)
+        .contains("Cache override 'spring.cache.multilevel.caches.broken' will never apply");
+  }
+
+  @Test
+  void circuitBreakerIsClosedByDefault() {
+    runner
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .run(
+            context ->
+                Assertions.assertThat(
+                        context
+                            .getBean(
+                                MultiLevelCacheAutoConfiguration.CIRCUIT_BREAKER_NAME,
+                                CircuitBreaker.class)
+                            .getState())
+                    .isEqualTo(CircuitBreaker.State.CLOSED));
+  }
+
+  @Test
+  void circuitBreakerCanBeDisabled(CapturedOutput output) {
+    runner
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .withPropertyValues("spring.cache.multilevel.circuit-breaker.enabled=false")
+        .withPropertyValues("spring.cache.multilevel.time-to-live=10s")
+        .withPropertyValues("spring.cache.multilevel.local.expiry-jitter=80")
+        .withPropertyValues(
+            "spring.cache.multilevel.circuit-breaker.wait-duration-in-open-state=3s")
+        .run(
+            context ->
+                Assertions.assertThat(
+                        context
+                            .getBean(
+                                MultiLevelCacheAutoConfiguration.CIRCUIT_BREAKER_NAME,
+                                CircuitBreaker.class)
+                            .getState())
+                    .isEqualTo(CircuitBreaker.State.DISABLED));
+
+    Assertions.assertThat(output).doesNotContain("Cache circuit breaker wait duration");
   }
 }

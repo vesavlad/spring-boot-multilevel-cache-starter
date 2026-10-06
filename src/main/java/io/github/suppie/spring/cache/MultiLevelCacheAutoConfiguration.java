@@ -247,19 +247,16 @@ public class MultiLevelCacheAutoConfiguration {
       cbc.recordException(RedisFailureClassifier::isAvailabilityFailure);
       cbc.ignoreException(throwable -> !RedisFailureClassifier.isAvailabilityFailure(throwable));
 
-      Duration recommendedMaxDurationInOpenState =
-          cacheProperties
-              .getTimeToLive()
-              .multipliedBy(100L - cacheProperties.getLocal().getExpiryJitter())
-              .dividedBy(200);
-
-      if (props.getWaitDurationInOpenState().compareTo(recommendedMaxDurationInOpenState) > 0) {
-        log.warn(
-            "Cache circuit breaker wait duration in open state {} is more than recommended value of"
-                + " {}, this can result in local cache expiry while circuit breaker is still in"
-                + " OPEN state.",
-            props.getWaitDurationInOpenState(),
-            recommendedMaxDurationInOpenState);
+      if (props.isEnabled()) {
+        Duration waitDurationInOpenState = props.getWaitDurationInOpenState();
+        warnIfOpenStateOutlastsLocalExpiry(waitDurationInOpenState, cacheProperties, null);
+        cacheProperties
+            .getCaches()
+            .keySet()
+            .forEach(
+                name ->
+                    warnIfOpenStateOutlastsLocalExpiry(
+                        waitDurationInOpenState, cacheProperties.forCache(name), name));
       }
 
       cbr.addConfiguration(CIRCUIT_BREAKER_CONFIGURATION_NAME, cbc.build());
@@ -267,6 +264,9 @@ public class MultiLevelCacheAutoConfiguration {
 
     CircuitBreaker cb =
         cbr.circuitBreaker(CIRCUIT_BREAKER_NAME, CIRCUIT_BREAKER_CONFIGURATION_NAME);
+    if (!cacheProperties.getCircuitBreaker().isEnabled()) {
+      cb.transitionToDisabledState();
+    }
     cb.getEventPublisher()
         .onError(
             event ->
@@ -291,6 +291,42 @@ public class MultiLevelCacheAutoConfiguration {
                     event.getStateTransition().getFromState(),
                     event.getStateTransition().getToState()));
     return cb;
+  }
+
+  /**
+   * Warns when the breaker may stay open longer than local entries survive, which would leave the
+   * local tier empty during a Redis outage.
+   */
+  private static void warnIfOpenStateOutlastsLocalExpiry(
+      Duration waitDurationInOpenState,
+      MultiLevelCacheConfigurationProperties properties,
+      @Nullable String cacheName) {
+    Duration recommendedMaxDurationInOpenState =
+        properties
+            .effectiveLocalTimeToLive()
+            .multipliedBy(100L - properties.getLocal().getExpiryJitter())
+            .dividedBy(200);
+
+    if (waitDurationInOpenState.compareTo(recommendedMaxDurationInOpenState) <= 0) {
+      return;
+    }
+
+    if (cacheName == null) {
+      log.warn(
+          "Cache circuit breaker wait duration in open state {} is more than recommended value of"
+              + " {}, this can result in local cache expiry while circuit breaker is still in"
+              + " OPEN state.",
+          waitDurationInOpenState,
+          recommendedMaxDurationInOpenState);
+    } else {
+      log.warn(
+          "Cache circuit breaker wait duration in open state {} is more than recommended value of"
+              + " {} for cache '{}', this can result in local cache expiry while circuit breaker"
+              + " is still in OPEN state.",
+          waitDurationInOpenState,
+          recommendedMaxDurationInOpenState,
+          cacheName);
+    }
   }
 
   /**
