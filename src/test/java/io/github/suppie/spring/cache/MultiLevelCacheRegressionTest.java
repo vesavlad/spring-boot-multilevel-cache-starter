@@ -18,10 +18,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import org.junit.jupiter.api.Test;
 import org.springframework.cache.Cache;
+import org.springframework.cache.support.NullValue;
 import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.serializer.RedisSerializer;
 import org.springframework.data.redis.serializer.SerializationException;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
 
 class MultiLevelCacheRegressionTest {
 
@@ -352,11 +354,26 @@ class MultiLevelCacheRegressionTest {
   }
 
   @Test
-  void redisNullCachingIsDisabled() {
+  void redisNullCachingIsDisabledByDefault() {
     MultiLevelCache cache =
         cache("cache", new TestRedisCacheWriter(), RedisSerializer.json(), breaker("nulls"));
 
     assertThat(cache.getCacheConfiguration().getAllowCacheNullValues()).isFalse();
+    assertThat(cache.isAllowNullValues()).isFalse();
+  }
+
+  @Test
+  void redisNullCachingFollowsProperty() {
+    MultiLevelCache cache =
+        cache(
+            "cache",
+            new TestRedisCacheWriter(),
+            RedisSerializer.json(),
+            breaker("nulls-enabled"),
+            true);
+
+    assertThat(cache.getCacheConfiguration().getAllowCacheNullValues()).isTrue();
+    assertThat(cache.isAllowNullValues()).isTrue();
   }
 
   @Test
@@ -403,13 +420,271 @@ class MultiLevelCacheRegressionTest {
     assertThat(writer.clears).hasValue(0);
   }
 
+  @Test
+  void nullMarkerIsAMissWhenNullCachingIsDisabled() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache enabled =
+        cache("cache", writer, RedisSerializer.json(), breaker("marker-writer"), true);
+    MultiLevelCache disabled =
+        cache("cache", writer, RedisSerializer.json(), breaker("marker-reader"));
+    enabled.nativePut("key", null);
+
+    assertThat(disabled.get("key")).isNull();
+    assertThat(disabled.getLocalCache().getIfPresent(disabled.toLocalKey("key"))).isNull();
+  }
+
+  @Test
+  void loaderRunsOverNullMarkerWhenNullCachingIsDisabled() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache enabled =
+        cache("cache", writer, RedisSerializer.json(), breaker("loader-marker-writer"), true);
+    MultiLevelCache disabled =
+        cache("cache", writer, RedisSerializer.json(), breaker("loader-marker-reader"));
+    enabled.nativePut("key", null);
+
+    assertThat(disabled.get("key", () -> "loaded")).isEqualTo("loaded");
+    assertThat((Object) disabled.nativeGet("key")).isEqualTo("loaded");
+  }
+
+  @Test
+  void putIfAbsentReplacesNullMarkerWhenNullCachingIsDisabled() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache enabled =
+        cache("cache", writer, RedisSerializer.json(), breaker("pia-marker-writer"), true);
+    MultiLevelCache disabled =
+        cache("cache", writer, RedisSerializer.json(), breaker("pia-marker-reader"));
+    enabled.nativePut("key", null);
+
+    assertThat(disabled.putIfAbsent("key", "candidate")).isNull();
+    assertThat((Object) disabled.nativeGet("key")).isEqualTo("candidate");
+    assertThat(disabled.getLocalCache().getIfPresent(disabled.toLocalKey("key")))
+        .isEqualTo("candidate");
+  }
+
+  @Test
+  void loaderReturningNullIsCachedWhenNullCachingIsEnabled() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache cache =
+        cache("cache", writer, RedisSerializer.json(), breaker("null-loader"), true);
+    AtomicInteger loads = new AtomicInteger();
+
+    assertThat(
+            (Object)
+                cache.get(
+                    "key",
+                    () -> {
+                      loads.incrementAndGet();
+                      return null;
+                    }))
+        .isNull();
+    assertThat(
+            (Object)
+                cache.get(
+                    "key",
+                    () -> {
+                      loads.incrementAndGet();
+                      return null;
+                    }))
+        .isNull();
+
+    assertThat(loads).hasValue(1);
+    assertThat(cache.getLocalCache().getIfPresent(cache.toLocalKey("key")))
+        .isSameAs(NullValue.INSTANCE);
+    Cache.ValueWrapper wrapper = cache.get("key");
+    assertThat(wrapper).isNotNull();
+    assertThat(wrapper.get()).isNull();
+  }
+
+  @Test
+  void cachedNullIsSharedThroughRedis() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache first =
+        cache("cache", writer, RedisSerializer.json(), breaker("shared-null-first"), true);
+    MultiLevelCache second =
+        cache("cache", writer, RedisSerializer.json(), breaker("shared-null-second"), true);
+
+    assertThat((Object) first.get("key", () -> null)).isNull();
+    Object secondResult =
+        second.get(
+            "key",
+            () -> {
+              throw new AssertionError("Loader must not run for a cached null");
+            });
+
+    assertThat(secondResult).isNull();
+    assertThat(second.getLocalCache().getIfPresent(second.toLocalKey("key")))
+        .isSameAs(NullValue.INSTANCE);
+  }
+
+  @Test
+  void putNullStoresMarkerWhenNullCachingIsEnabled() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache cache =
+        cache("cache", writer, RedisSerializer.json(), breaker("put-null"), true);
+    MultiLevelCache other =
+        cache("cache", writer, RedisSerializer.json(), breaker("put-null-other"), true);
+    cache.put("key", "value");
+
+    cache.put("key", null);
+
+    assertThat(cache.getLocalCache().getIfPresent(cache.toLocalKey("key")))
+        .isSameAs(NullValue.INSTANCE);
+    Cache.ValueWrapper wrapper = other.get("key");
+    assertThat(wrapper).isNotNull();
+    assertThat(wrapper.get()).isNull();
+  }
+
+  @Test
+  void putIfAbsentNullStoresMarkerWhenNullCachingIsEnabled() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache cache =
+        cache("cache", writer, RedisSerializer.json(), breaker("pia-null"), true);
+    MultiLevelCache other =
+        cache("cache", writer, RedisSerializer.json(), breaker("pia-null-other"), true);
+
+    assertThat(cache.putIfAbsent("key", null)).isNull();
+
+    assertThat(writer.putIfAbsentCalls).hasValue(1);
+    assertThat(cache.getLocalCache().getIfPresent(cache.toLocalKey("key")))
+        .isSameAs(NullValue.INSTANCE);
+    Cache.ValueWrapper wrapper = other.get("key");
+    assertThat(wrapper).isNotNull();
+    assertThat(wrapper.get()).isNull();
+  }
+
+  @Test
+  void putIfAbsentTreatsCachedNullAsPresent() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache cache =
+        cache("cache", writer, RedisSerializer.json(), breaker("pia-present"), true);
+    MultiLevelCache cold =
+        cache("cache", writer, RedisSerializer.json(), breaker("pia-present-cold"), true);
+    cache.put("key", null);
+
+    Cache.ValueWrapper warm = cache.putIfAbsent("key", "candidate");
+    Cache.ValueWrapper remote = cold.putIfAbsent("key", "candidate");
+
+    assertThat(warm).isNotNull();
+    assertThat(warm.get()).isNull();
+    assertThat(remote).isNotNull();
+    assertThat(remote.get()).isNull();
+    assertThat(cold.getLocalCache().getIfPresent(cold.toLocalKey("key")))
+        .isSameAs(NullValue.INSTANCE);
+  }
+
+  @Test
+  void evictIfPresentReportsCachedNull() {
+    MultiLevelCache cache =
+        cache(
+            "cache",
+            new TestRedisCacheWriter(),
+            RedisSerializer.json(),
+            breaker("evict-null"),
+            true);
+    cache.put("key", null);
+
+    assertThat(cache.evictIfPresent("key")).isTrue();
+    assertThat(cache.get("key")).isNull();
+  }
+
+  @Test
+  void typedGetReturnsNullForCachedNull() {
+    MultiLevelCache cache =
+        cache(
+            "cache",
+            new TestRedisCacheWriter(),
+            RedisSerializer.json(),
+            breaker("typed-null"),
+            true);
+    cache.put("key", null);
+
+    assertThat(cache.get("key", String.class)).isNull();
+  }
+
+  @Test
+  void nullIsCachedLocallyWhenRedisIsUnavailable() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    writer.failWith(new RedisConnectionFailureException("Redis is unavailable"));
+    MultiLevelCache cache =
+        cache("cache", writer, RedisSerializer.json(), breaker("null-availability"), true);
+
+    assertThat((Object) cache.get("key", () -> null)).isNull();
+    assertThat(cache.getLocalCache().getIfPresent(cache.toLocalKey("key")))
+        .isSameAs(NullValue.INSTANCE);
+  }
+
+  @Test
+  void nullMarkerDoesNotDependOnValueSerializer() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache cache =
+        cache("cache", writer, stringSerializer(), breaker("string-null"), true);
+    MultiLevelCache other =
+        cache("cache", writer, stringSerializer(), breaker("string-null-other"), true);
+
+    cache.put("key", null);
+
+    Cache.ValueWrapper wrapper = other.get("key");
+    assertThat(wrapper).isNotNull();
+    assertThat(wrapper.get()).isNull();
+  }
+
+  @Test
+  void invalidatedCachedNullIsReplacedByLaterValue() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache first =
+        cache("cache", writer, RedisSerializer.json(), breaker("null-replaced-first"), true);
+    MultiLevelCache second =
+        cache("cache", writer, RedisSerializer.json(), breaker("null-replaced-second"), true);
+    first.put("key", null);
+
+    second.put("key", "created");
+    first.invalidateLocalEntry(first.toLocalKey("key"));
+
+    assertThat(first.get("key", () -> "unused")).isEqualTo("created");
+  }
+
+  @Test
+  void loaderReturningNullStillFailsWhenNullCachingIsDisabled() {
+    MultiLevelCache cache =
+        cache(
+            "cache", new TestRedisCacheWriter(), RedisSerializer.json(), breaker("null-disabled"));
+
+    assertThatThrownBy(() -> cache.get("key", () -> null))
+        .isInstanceOf(Cache.ValueRetrievalException.class);
+    cache.put("key", "value");
+    cache.put("key", null);
+    assertThat(cache.get("key")).isNull();
+    assertThat((Object) cache.nativeGet("key")).isNull();
+  }
+
+  @Test
+  void serializerDecodedNullValueIsAMissWhenNullCachingIsDisabled() {
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache cache =
+        cache("cache", writer, RedisSerializer.json(), breaker("json-null-value"));
+    cache.nativePut("key", NullValue.INSTANCE);
+
+    assertThat(cache.get("key")).isNull();
+    assertThat(cache.getLocalCache().getIfPresent(cache.toLocalKey("key"))).isNull();
+  }
+
   private static MultiLevelCache cache(
       String name,
       TestRedisCacheWriter writer,
       RedisSerializer<Object> serializer,
       CircuitBreaker breaker) {
+    return cache(name, writer, serializer, breaker, false);
+  }
+
+  private static MultiLevelCache cache(
+      String name,
+      TestRedisCacheWriter writer,
+      RedisSerializer<Object> serializer,
+      CircuitBreaker breaker,
+      boolean cacheNullValues) {
     MultiLevelCacheConfigurationProperties properties =
         new MultiLevelCacheConfigurationProperties();
+    properties.setCacheNullValues(cacheNullValues);
     RedisTemplate<Object, Object> template = mock(RedisTemplate.class);
     doReturn(serializer).when(template).getValueSerializer();
     return new MultiLevelCache(
@@ -420,6 +695,11 @@ class MultiLevelCacheRegressionTest {
         Caffeine.newBuilder().maximumSize(100).build(),
         breaker,
         name + "-instance");
+  }
+
+  @SuppressWarnings("unchecked")
+  private static RedisSerializer<Object> stringSerializer() {
+    return (RedisSerializer<Object>) (RedisSerializer<?>) StringRedisSerializer.UTF_8;
   }
 
   private static CircuitBreaker breaker(String name) {

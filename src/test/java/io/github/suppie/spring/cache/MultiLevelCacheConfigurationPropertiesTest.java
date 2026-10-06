@@ -4,7 +4,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.suppie.spring.cache.MultiLevelCacheConfigurationProperties.CircuitBreakerProperties;
 import java.time.Duration;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 
 class MultiLevelCacheConfigurationPropertiesTest {
 
@@ -54,5 +57,26 @@ class MultiLevelCacheConfigurationPropertiesTest {
 
     assertThat(configuration.usePrefix()).isTrue();
     assertThat(configuration.getKeyPrefixFor("books")).isEqualTo("ml-books::");
+  }
+
+  @Test
+  void nullValueCachingIsDisabledByDefault() {
+    MultiLevelCacheConfigurationProperties properties =
+        new MultiLevelCacheConfigurationProperties();
+
+    assertThat(properties.isCacheNullValues()).isFalse();
+  }
+
+  @Test
+  void nullValueCachingBindsFromKebabCaseProperty() {
+    Binder binder =
+        new Binder(
+            new MapConfigurationPropertySource(
+                Map.of("spring.cache.multilevel.cache-null-values", "true")));
+
+    MultiLevelCacheConfigurationProperties properties =
+        binder.bind("spring.cache.multilevel", MultiLevelCacheConfigurationProperties.class).get();
+
+    assertThat(properties.isCacheNullValues()).isTrue();
   }
 }

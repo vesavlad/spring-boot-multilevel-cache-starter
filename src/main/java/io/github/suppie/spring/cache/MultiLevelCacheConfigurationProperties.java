@@ -51,6 +51,12 @@ public class MultiLevelCacheConfigurationProperties {
   /** Redis topic used to synchronize local-entry invalidation between instances. */
   private String topic = "cache:multilevel:topic";
 
+  /**
+   * Whether to cache {@code null} results in both tiers. Enable only after every instance sharing
+   * the Redis keyspace runs a version that understands cached null markers.
+   */
+  private boolean cacheNullValues = false;
+
   /** Local Caffeine cache settings. */
   @NestedConfigurationProperty private LocalCacheProperties local = new LocalCacheProperties();
 

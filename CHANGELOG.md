@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Opt-in negative caching via `spring.cache.multilevel.cache-null-values` (default `false`).
+  When enabled, `null` results are cached in Caffeine and Redis with the regular TTL.
+
+### Compatibility
+
+- Default behavior is unchanged, except that Redis null markers written by instances with null
+  caching enabled are treated as cache misses instead of failing deserialization.
+- Enable `cache-null-values` only after every instance sharing the Redis keyspace runs a release
+  that includes this change; instances on earlier releases may fail to deserialize cached nulls.
+
 ## 4.1.1.0
 
 ### Fixed
