@@ -27,6 +27,7 @@ package io.github.suppie.spring.cache;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.NonNull;
 import org.junit.jupiter.api.Assertions;
@@ -296,6 +297,77 @@ class MultiLevelCacheTestcontainersTest extends AbstractRedisIntegrationTest {
       } catch (Exception ignored) {
       }
     }
+  }
+
+  @Test
+  void cachedNullIsSharedAcrossInstances() {
+    final String key = "cachedNullIsSharedAcrossInstances";
+    MultiLevelCacheConfigurationProperties properties = nullCachingProperties(true);
+    MultiLevelCache first = newInstanceCache(properties, key);
+    MultiLevelCache second = newInstanceCache(properties, key);
+    AtomicInteger loads = new AtomicInteger();
+
+    try {
+      Assertions.assertNull(
+          first.get(
+              key,
+              () -> {
+                loads.incrementAndGet();
+                return null;
+              }));
+      Assertions.assertNull(
+          second.get(
+              key,
+              () -> {
+                loads.incrementAndGet();
+                return null;
+              }));
+
+      Assertions.assertEquals(1, loads.get(), "Loader must run once across instances");
+      Cache.ValueWrapper wrapper = second.get(key);
+      Assertions.assertNotNull(wrapper, "Cached null must be a hit");
+      Assertions.assertNull(wrapper.get(), "Cached null must surface as null");
+    } finally {
+      first.evict(key);
+    }
+  }
+
+  @Test
+  void nullMarkerIsAMissForInstanceWithNullCachingDisabled() {
+    final String key = "nullMarkerIsAMissForInstanceWithNullCachingDisabled";
+    MultiLevelCache enabled = newInstanceCache(nullCachingProperties(true), key);
+    MultiLevelCache disabled = newInstanceCache(nullCachingProperties(false), key);
+
+    try {
+      enabled.put(key, null);
+
+      Assertions.assertNull(disabled.get(key), "Null marker must be a miss when disabled");
+      Assertions.assertEquals(
+          "loaded", disabled.get(key, () -> "loaded"), "Loader must run over a null marker");
+    } finally {
+      enabled.evict(key);
+    }
+  }
+
+  private MultiLevelCacheConfigurationProperties nullCachingProperties(boolean cacheNullValues) {
+    MultiLevelCacheConfigurationProperties properties =
+        new MultiLevelCacheConfigurationProperties();
+    properties.setTimeToLive(cacheProperties.getTimeToLive());
+    properties.setUseKeyPrefix(cacheProperties.isUseKeyPrefix());
+    properties.setKeyPrefix(cacheProperties.getKeyPrefix());
+    properties.setTopic(cacheProperties.getTopic());
+    properties.setCacheNullValues(cacheNullValues);
+    return properties;
+  }
+
+  private MultiLevelCache newInstanceCache(
+      MultiLevelCacheConfigurationProperties properties, String name) {
+    MultiLevelCacheManager manager =
+        new MultiLevelCacheManager(
+            cachePropertiesProvider, properties, multiLevelCacheRedisTemplate, circuitBreaker);
+    MultiLevelCache cache = (MultiLevelCache) manager.getCache(name);
+    Assertions.assertNotNull(cache, "Cache should be automatically created upon request");
+    return cache;
   }
 
   @SuppressWarnings("unchecked")

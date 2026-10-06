@@ -29,6 +29,7 @@ dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-webmvc'
 	implementation 'org.springframework.boot:spring-boot-starter-cache'
 	implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+	implementation 'org.apache.fory:fory-json:1.7.6'
 	implementation project(':')
 
 	testImplementation 'org.springframework.boot:spring-boot-starter-test'

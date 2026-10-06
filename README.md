@@ -53,8 +53,15 @@ implementation 'io.github.suppierk:spring-boot-multilevel-cache-starter:4.1.1.1'
   unavailable, the operation remains atomic only inside the current application instance.
 - Connection failures, timeouts, and an open circuit breaker fall back to local caching. Cache key
   conversion, serialization, validation, and programming errors are propagated to the caller.
-- Null values are not cached. `put(key, null)` and `putIfAbsent(key, null)` retain their existing
-  eviction behavior, and a loader returning null fails with `Cache.ValueRetrievalException`.
+- Null values are not cached by default. `put(key, null)` and `putIfAbsent(key, null)` evict the
+  key, and a loader returning null fails with `Cache.ValueRetrievalException`.
+- Set `spring.cache.multilevel.cache-null-values=true` for negative caching: `null` results are
+  cached in both tiers with the regular TTL, so a missing entity is loaded once per cluster until
+  the cached null expires or is evicted. `put(key, null)` stores the null, a loader may return
+  null, and a cached null counts as present for `putIfAbsent`.
+- Enable `cache-null-values` only after every instance sharing the Redis keyspace runs a version
+  with null-caching support. Older instances fail to deserialize cached nulls. Instances with the
+  flag disabled treat cached nulls as misses, so disabling it again is safe.
 - Redis Pub/Sub invalidation uses its own stable v0 JSON codec, independently of the configured
   cache-value serializer.
 
@@ -127,6 +134,7 @@ configured Redis serializer.
 | `spring.cache.multilevel.use-key-prefix`        | `false`                  | Enables `key-prefix`; set to `true` only when you supply a non-empty prefix                         |
 | `spring.cache.multilevel.key-prefix`            | `""`                     | Optional Redis key prefix                                                                           |
 | `spring.cache.multilevel.topic`                 | `cache:multilevel:topic` | Redis Pub/Sub channel used to broadcast evictions                                                   |
+| `spring.cache.multilevel.cache-null-values`     | `false`                  | Caches `null` results in both tiers; see the rollout note under "Cache behavior"                    |
 | `spring.cache.multilevel.local.max-size`        | `2000`                   | Maximum number of entries retained in Caffeine                                                      |
 | `spring.cache.multilevel.local.expiry-jitter`   | `50`                     | Percentage used to randomize the local TTL                                                          |
 | `spring.cache.multilevel.local.expiration-mode` | `after-create`           | One of `after-create`, `after-update`, `after-read`                                                 |
@@ -151,6 +159,7 @@ spring:
       use-key-prefix: false
       key-prefix: ""
       topic: "cache:multilevel:topic"
+      cache-null-values: false
       # Local Caffeine cache properties
       local:
         max-size: 2000
