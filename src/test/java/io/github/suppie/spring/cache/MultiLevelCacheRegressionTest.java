@@ -8,6 +8,7 @@ import static org.mockito.Mockito.mock;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -682,6 +683,129 @@ class MultiLevelCacheRegressionTest {
 
     assertThat(cache.get("key")).isNull();
     assertThat(cache.getLocalCache().getIfPresent(cache.toLocalKey("key"))).isNull();
+  }
+
+  @Test
+  void removingIgnoredNullMarkerIsTimedAsEvict() {
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    MultiLevelCache cache = meteredCache(new TestRedisCacheWriter(), breaker("marker"), registry);
+    cache.nativePut("key", NullValue.INSTANCE);
+
+    assertThat(cache.putIfAbsent("key", "value")).isNull();
+
+    assertThat(redisCalls(registry, "evict", "success")).isEqualTo(1L);
+    assertThat(registry.find("cache.multilevel.redis.calls").timers())
+        .allMatch(timer -> !timer.getId().getTag("operation").contains(" "));
+  }
+
+  @Test
+  void readsAreCountedByServingTier() {
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    MultiLevelCache cache = meteredCache(writer, breaker("tiers"), registry);
+    cache.nativePut("remote", "value");
+
+    assertThat(cache.get("missing")).isNull();
+    assertThat(cache.get("remote").get()).isEqualTo("value");
+    assertThat(cache.get("remote").get()).isEqualTo("value");
+
+    assertThat(gets(registry, "miss")).isEqualTo(1d);
+    assertThat(gets(registry, "remote_hit")).isEqualTo(1d);
+    assertThat(gets(registry, "local_hit")).isEqualTo(1d);
+    assertThat(redisCalls(registry, "read", "success")).isEqualTo(2L);
+  }
+
+  @Test
+  void loaderReadCountsOneMissThenLocalHits() {
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    MultiLevelCache cache =
+        meteredCache(new TestRedisCacheWriter(), breaker("loader-metrics"), registry);
+
+    assertThat(cache.get("key", () -> "loaded")).isEqualTo("loaded");
+    assertThat(cache.get("key", () -> "unused")).isEqualTo("loaded");
+
+    assertThat(gets(registry, "miss")).isEqualTo(1d);
+    assertThat(gets(registry, "local_hit")).isEqualTo(1d);
+    assertThat(gets(registry, "remote_hit")).isEqualTo(0d);
+  }
+
+  @Test
+  void unavailableAndRejectedRedisCallsAreTimedSeparately() {
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    writer.failWith(new RedisConnectionFailureException("Redis is unavailable"));
+    CircuitBreaker breaker = breaker("outcomes");
+    MultiLevelCache cache = meteredCache(writer, breaker, registry);
+
+    assertThat(cache.get("first")).isNull();
+    assertThat(breaker.getState()).isEqualTo(CircuitBreaker.State.OPEN);
+    assertThat(cache.get("second")).isNull();
+
+    assertThat(redisCalls(registry, "read", "unavailable")).isEqualTo(1L);
+    assertThat(redisCalls(registry, "read", "rejected")).isEqualTo(1L);
+    assertThat(gets(registry, "miss")).isEqualTo(2d);
+  }
+
+  @Test
+  void nonAvailabilityFailureIsTimedAsErrorAndStillPropagates() {
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    TestRedisCacheWriter writer = new TestRedisCacheWriter();
+    IllegalStateException failure = new IllegalStateException("corrupt reply");
+    writer.failWith(failure);
+    MultiLevelCache cache = meteredCache(writer, breaker("error-metrics"), registry);
+
+    assertThatThrownBy(() -> cache.get("key")).isSameAs(failure);
+
+    assertThat(redisCalls(registry, "read", "error")).isEqualTo(1L);
+  }
+
+  @Test
+  void successfulPutTimesWriteAndPublishAndCountsSentInvalidation() {
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    MultiLevelCache cache = meteredCache(new TestRedisCacheWriter(), breaker("publish"), registry);
+
+    cache.put("key", "value");
+
+    assertThat(redisCalls(registry, "write", "success")).isEqualTo(1L);
+    assertThat(redisCalls(registry, "publish", "success")).isEqualTo(1L);
+    assertThat(
+            registry
+                .get("cache.multilevel.invalidations")
+                .tags("cache", "metered", "direction", "sent")
+                .counter()
+                .count())
+        .isEqualTo(1d);
+  }
+
+  private static MultiLevelCache meteredCache(
+      TestRedisCacheWriter writer, CircuitBreaker breaker, SimpleMeterRegistry registry) {
+    RedisTemplate<Object, Object> template = mock(RedisTemplate.class);
+    doReturn(RedisSerializer.json()).when(template).getValueSerializer();
+    return new MultiLevelCache(
+        "metered",
+        new MultiLevelCacheConfigurationProperties(),
+        writer,
+        template,
+        Caffeine.newBuilder().maximumSize(100).build(),
+        breaker,
+        "metered-instance",
+        MultiLevelCacheMetrics.create(registry, "metered"));
+  }
+
+  private static double gets(SimpleMeterRegistry registry, String result) {
+    return registry
+        .get("cache.multilevel.gets")
+        .tags("cache", "metered", "result", result)
+        .counter()
+        .count();
+  }
+
+  private static long redisCalls(SimpleMeterRegistry registry, String operation, String outcome) {
+    return registry
+        .get("cache.multilevel.redis.calls")
+        .tags("cache", "metered", "operation", operation, "outcome", outcome)
+        .timer()
+        .count();
   }
 
   private static MultiLevelCache cache(

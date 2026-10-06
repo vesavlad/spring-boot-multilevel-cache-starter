@@ -26,8 +26,10 @@ package io.github.suppie.spring.cache;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.core.functions.CheckedSupplier;
+import io.github.suppie.spring.cache.MultiLevelCacheMetrics.RedisCallOutcome;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Objects;
@@ -86,6 +88,7 @@ public class MultiLevelCache extends RedisCache {
   private final ReentrantReadWriteLock cacheWideLock = new ReentrantReadWriteLock();
   private final RedisTemplate<Object, Object> redisTemplate;
   private final String instanceId;
+  private final MultiLevelCacheMetrics metrics;
 
   /**
    * Creates a multi-level cache using a non-locking Redis writer.
@@ -107,12 +110,42 @@ public class MultiLevelCache extends RedisCache {
     this(
         name,
         properties,
+        redisTemplate,
+        localCache,
+        cacheCircuitBreaker,
+        instanceId,
+        MultiLevelCacheMetrics.NOOP);
+  }
+
+  /**
+   * Creates a multi-level cache using a non-locking Redis writer and the given metrics.
+   *
+   * @param name cache name
+   * @param properties cache properties
+   * @param redisTemplate template used for values and invalidation publication
+   * @param localCache local L1 cache
+   * @param cacheCircuitBreaker Redis circuit breaker
+   * @param instanceId current instance identifier
+   * @param metrics meters recording reads, Redis calls and invalidations
+   */
+  public MultiLevelCache(
+      String name,
+      MultiLevelCacheConfigurationProperties properties,
+      RedisTemplate<Object, Object> redisTemplate,
+      Cache<@NonNull Object, Object> localCache,
+      CircuitBreaker cacheCircuitBreaker,
+      String instanceId,
+      MultiLevelCacheMetrics metrics) {
+    this(
+        name,
+        properties,
         RedisCacheWriter.nonLockingRedisCacheWriter(
             Objects.requireNonNull(redisTemplate.getConnectionFactory(), NO_REDIS_CONNECTION)),
         redisTemplate,
         localCache,
         cacheCircuitBreaker,
-        instanceId);
+        instanceId,
+        metrics);
   }
 
   /**
@@ -134,18 +167,56 @@ public class MultiLevelCache extends RedisCache {
       Cache<@NonNull Object, Object> localCache,
       CircuitBreaker cacheCircuitBreaker,
       String instanceId) {
+    this(
+        name,
+        properties,
+        redisCacheWriter,
+        redisTemplate,
+        localCache,
+        cacheCircuitBreaker,
+        instanceId,
+        MultiLevelCacheMetrics.NOOP);
+  }
+
+  /**
+   * Creates a multi-level cache with an explicit Redis writer and the given metrics.
+   *
+   * @param name cache name
+   * @param properties cache properties
+   * @param redisCacheWriter Redis writer
+   * @param redisTemplate template used for values and invalidation publication
+   * @param localCache local L1 cache
+   * @param cacheCircuitBreaker Redis circuit breaker
+   * @param instanceId current instance identifier
+   * @param metrics meters recording reads, Redis calls and invalidations
+   */
+  public MultiLevelCache(
+      String name,
+      MultiLevelCacheConfigurationProperties properties,
+      RedisCacheWriter redisCacheWriter,
+      RedisTemplate<Object, Object> redisTemplate,
+      Cache<@NonNull Object, Object> localCache,
+      CircuitBreaker cacheCircuitBreaker,
+      String instanceId,
+      MultiLevelCacheMetrics metrics) {
     super(name, redisCacheWriter, adjustRedisCacheConfiguration(properties, redisTemplate));
     this.properties = Objects.requireNonNull(properties);
     this.redisTemplate = Objects.requireNonNull(redisTemplate);
     this.localCache = Objects.requireNonNull(localCache);
     this.cacheCircuitBreaker = Objects.requireNonNull(cacheCircuitBreaker);
     this.instanceId = Objects.requireNonNull(instanceId);
+    this.metrics = Objects.requireNonNull(metrics);
     this.locks = Caffeine.newBuilder().weakValues().build();
   }
 
   /** Returns the local tier for package-level diagnostics and tests. */
   Cache<@NonNull Object, Object> getLocalCache() {
     return localCache;
+  }
+
+  /** Returns this cache's meters for package-level instrumentation and tests. */
+  MultiLevelCacheMetrics getMetrics() {
+    return metrics;
   }
 
   /** Reads directly from Redis, bypassing the local tier and circuit-breaker fallback. */
@@ -180,6 +251,7 @@ public class MultiLevelCache extends RedisCache {
     Object localValue = localCache.getIfPresent(localKey);
     if (localValue != null) {
       log.trace("Local cache hit for cache '{}' and key '{}'", getName(), localKey);
+      metrics.localHit();
       return localValue;
     }
 
@@ -204,6 +276,7 @@ public class MultiLevelCache extends RedisCache {
     try {
       Object localValue = localCache.getIfPresent(localKey);
       if (localValue != null) {
+        metrics.localHit();
         return localValue;
       }
 
@@ -212,11 +285,13 @@ public class MultiLevelCache extends RedisCache {
           callRedis(() -> getCacheWriter().get(getName(), redisKey), "read");
       if (!remote.available()) {
         log.trace("Redis unavailable for cache '{}' and key '{}'", getName(), localKey);
+        metrics.miss();
         return null;
       }
       byte[] remoteBytes = remote.value();
       if (remoteBytes == null) {
         log.trace("Redis cache miss for cache '{}' and key '{}'", getName(), localKey);
+        metrics.miss();
         return null;
       }
 
@@ -226,11 +301,13 @@ public class MultiLevelCache extends RedisCache {
             "Ignoring Redis null value for cache '{}' and key '{}' because null caching is disabled",
             getName(),
             localKey);
+        metrics.miss();
         return null;
       }
 
       localCache.put(localKey, value);
       log.trace("Redis cache hit for cache '{}' and key '{}'", getName(), localKey);
+      metrics.remoteHit();
       return value;
     } finally {
       cacheWideLock.readLock().unlock();
@@ -258,6 +335,7 @@ public class MultiLevelCache extends RedisCache {
     String localKey = convertKey(key);
     Object localValue = localCache.getIfPresent(localKey);
     if (localValue != null) {
+      metrics.localHit();
       return (T) fromStoreValue(localValue);
     }
 
@@ -266,6 +344,7 @@ public class MultiLevelCache extends RedisCache {
     try {
       localValue = localCache.getIfPresent(localKey);
       if (localValue != null) {
+        metrics.localHit();
         return (T) fromStoreValue(localValue);
       }
 
@@ -403,7 +482,7 @@ public class MultiLevelCache extends RedisCache {
                   getCacheWriter().evict(getName(), redisKey);
                   return null;
                 },
-                "remove null marker");
+                "evict");
         if (!removed.available()) {
           localCache.put(localKey, storeValue);
           return null;
@@ -586,20 +665,24 @@ public class MultiLevelCache extends RedisCache {
         new MultiLevelCacheEvictMessage(getName(), key, instanceId);
     byte[] body = CacheInvalidationCodec.serialize(message);
     byte @Nullable [] legacyBody = serializeLegacyInvalidation(message, body);
-    callRedis(
-        () -> {
-          redisTemplate.execute(
-              (RedisCallback<Long>)
-                  connection -> {
-                    Long recipients = connection.publish(channel, body);
-                    if (legacyBody != null) {
-                      connection.publish(channel, legacyBody);
-                    }
-                    return recipients;
-                  });
-          return null;
-        },
-        "publish invalidation");
+    RemoteCall<Object> published =
+        callRedis(
+            () -> {
+              redisTemplate.execute(
+                  (RedisCallback<Long>)
+                      connection -> {
+                        Long recipients = connection.publish(channel, body);
+                        if (legacyBody != null) {
+                          connection.publish(channel, legacyBody);
+                        }
+                        return recipients;
+                      });
+              return null;
+            },
+            "publish");
+    if (published.available()) {
+      metrics.invalidationSent();
+    }
   }
 
   /** Encodes the rolling-upgrade payload unless it duplicates the stable representation. */
@@ -622,16 +705,28 @@ public class MultiLevelCache extends RedisCache {
     return (RedisSerializer<Object>) redisTemplate.getValueSerializer();
   }
 
-  /** Runs Redis I/O through the breaker and distinguishes availability from data failures. */
+  /**
+   * Runs Redis I/O through the breaker, times it, and separates availability from data failures.
+   */
   private <T> RemoteCall<T> callRedis(CheckedSupplier<T> call, String operation) {
+    long start = System.nanoTime();
     try {
-      return new RemoteCall<>(true, cacheCircuitBreaker.executeCheckedSupplier(call));
+      T value = cacheCircuitBreaker.executeCheckedSupplier(call);
+      metrics.redisCall(operation, RedisCallOutcome.SUCCESS, System.nanoTime() - start);
+      return new RemoteCall<>(true, value);
     } catch (Throwable throwable) {
+      long elapsed = System.nanoTime() - start;
       Throwable failure = RedisFailureClassifier.unwrap(throwable);
       if (RedisFailureClassifier.isAvailabilityFailure(failure)) {
+        RedisCallOutcome outcome =
+            failure instanceof CallNotPermittedException
+                ? RedisCallOutcome.REJECTED
+                : RedisCallOutcome.UNAVAILABLE;
+        metrics.redisCall(operation, outcome, elapsed);
         log.debug("Redis {} unavailable for cache '{}'", operation, getName(), failure);
         return new RemoteCall<>(false, null);
       }
+      metrics.redisCall(operation, RedisCallOutcome.ERROR, elapsed);
       throw propagate(failure);
     }
   }

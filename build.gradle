@@ -74,6 +74,7 @@ dependencies {
 
 	api 'com.github.ben-manes.caffeine:caffeine'
 	api 'io.github.resilience4j:resilience4j-circuitbreaker'
+	api 'io.github.resilience4j:resilience4j-micrometer'
 
 	// Preserve the 4.1.x runtime dependency graph; remove in the next minor or major release.
 	runtimeOnly 'io.github.suppierk:java-throwable-utils:2.0.2'

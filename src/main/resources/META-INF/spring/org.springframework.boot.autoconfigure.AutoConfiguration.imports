@@ -1,1 +1,2 @@
 io.github.suppie.spring.cache.MultiLevelCacheAutoConfiguration
+io.github.suppie.spring.cache.MultiLevelCacheMetricsAutoConfiguration

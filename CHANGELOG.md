@@ -12,6 +12,14 @@
 - `spring.cache.multilevel.circuit-breaker.enabled` (default `true`). When `false`, the breaker
   is created in the `DISABLED` state: Redis is attempted on every operation and failures still
   fall back to the local tier.
+- Micrometer metrics: `cache.multilevel.gets` (tier hits/misses), `cache.multilevel.redis.calls`
+  (Redis latency and fallbacks), `cache.multilevel.invalidations[.rejected]`, and resilience4j
+  metrics for the Redis circuit breaker. Caches created on first use are covered.
+
+### Fixed
+
+- Local Caffeine statistics now record hits, misses and evictions (`recordStats()` was missing, so
+  these meters always reported zero).
 
 ### Compatibility
 
@@ -21,6 +29,10 @@
   that includes this change; instances on earlier releases may fail to deserialize cached nulls.
 - The circuit-breaker open-state recommendation now uses the effective local TTL (global
   `local.time-to-live` when set) and is also checked for each overridden cache.
+- Local-tier cache meters (`cache.size`, `cache.gets`, `cache.evictions`, …) are now registered by
+  the cache manager with tags `cache` and `tier=local`; the `name` and `cache.manager` tags that
+  Spring Boot's startup binding added are gone. Update dashboards or alerts that filter on them.
+  A custom `CacheMeterBinderProvider<MultiLevelCache>` no longer takes effect.
 
 ## 4.1.1.0
 

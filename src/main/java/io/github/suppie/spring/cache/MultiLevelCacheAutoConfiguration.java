@@ -28,9 +28,9 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.micrometer.tagged.TaggedCircuitBreakerMetrics;
 import io.github.suppie.spring.cache.MultiLevelCacheConfigurationProperties.CircuitBreakerProperties;
-import io.micrometer.core.instrument.binder.MeterBinder;
-import io.micrometer.core.instrument.binder.cache.CaffeineCacheMetrics;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
 import lombok.extern.slf4j.Slf4j;
 import org.jspecify.annotations.NonNull;
@@ -39,14 +39,12 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnSingleCandidate;
 import org.springframework.boot.cache.autoconfigure.CacheAutoConfiguration;
 import org.springframework.boot.cache.autoconfigure.CacheProperties;
-import org.springframework.boot.cache.metrics.CacheMeterBinderProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration;
 import org.springframework.boot.data.redis.autoconfigure.RedisMessageListenerContainerConfigurer;
@@ -131,6 +129,7 @@ public class MultiLevelCacheAutoConfiguration {
    * @param cacheProperties for multi-level cache
    * @param circuitBreaker if application defined its own circuit breaker
    * @param multiLevelCacheRedisTemplate to send messages about evicted entries
+   * @param meterRegistry optional registry receiving per-cache meters
    * @return cache manager for multi-level caching
    */
   @Bean
@@ -139,23 +138,14 @@ public class MultiLevelCacheAutoConfiguration {
       MultiLevelCacheConfigurationProperties cacheProperties,
       @Qualifier(CIRCUIT_BREAKER_NAME) CircuitBreaker circuitBreaker,
       @Qualifier(CACHE_REDIS_TEMPLATE_NAME)
-          RedisTemplate<Object, Object> multiLevelCacheRedisTemplate) {
+          RedisTemplate<Object, Object> multiLevelCacheRedisTemplate,
+      ObjectProvider<@NonNull MeterRegistry> meterRegistry) {
     return new MultiLevelCacheManager(
-        highLevelCacheProperties, cacheProperties, multiLevelCacheRedisTemplate, circuitBreaker);
-  }
-
-  /**
-   * Exposes Caffeine metrics for each local tier.
-   *
-   * @return cache meter binder for local level of multi level cache
-   */
-  @Bean
-  @ConditionalOnBean(MultiLevelCacheManager.class)
-  @ConditionalOnClass({MeterBinder.class, CacheMeterBinderProvider.class})
-  public CacheMeterBinderProvider<@NonNull MultiLevelCache>
-      multiLevelCacheCacheMeterBinderProvider() {
-    return (cache, tags) ->
-        new CaffeineCacheMetrics<>(cache.getLocalCache(), cache.getName(), tags);
+        highLevelCacheProperties,
+        cacheProperties,
+        multiLevelCacheRedisTemplate,
+        circuitBreaker,
+        meterRegistry.getIfAvailable());
   }
 
   /**
@@ -223,12 +213,14 @@ public class MultiLevelCacheAutoConfiguration {
    * Creates the circuit breaker that enables local-cache fallback during Redis outages.
    *
    * @param cacheProperties to get circuit breaker properties for fault tolerance
+   * @param meterRegistry optional registry receiving circuit-breaker meters
    * @return circuit breaker to handle Redis connection exceptions and fallback to use local cache
    */
   @Bean(name = CIRCUIT_BREAKER_NAME)
   @ConditionalOnMissingBean(name = CIRCUIT_BREAKER_NAME)
   public CircuitBreaker cacheCircuitBreaker(
-      MultiLevelCacheConfigurationProperties cacheProperties) {
+      MultiLevelCacheConfigurationProperties cacheProperties,
+      ObjectProvider<@NonNull MeterRegistry> meterRegistry) {
     CircuitBreakerRegistry cbr = CircuitBreakerRegistry.ofDefaults();
 
     if (cbr.getConfiguration(CIRCUIT_BREAKER_CONFIGURATION_NAME).isEmpty()) {
@@ -266,6 +258,10 @@ public class MultiLevelCacheAutoConfiguration {
         cbr.circuitBreaker(CIRCUIT_BREAKER_NAME, CIRCUIT_BREAKER_CONFIGURATION_NAME);
     if (!cacheProperties.getCircuitBreaker().isEnabled()) {
       cb.transitionToDisabledState();
+    }
+    MeterRegistry registry = meterRegistry.getIfAvailable();
+    if (registry != null) {
+      TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(cbr).bindTo(registry);
     }
     cb.getEventPublisher()
         .onError(
@@ -351,7 +347,10 @@ public class MultiLevelCacheAutoConfiguration {
       MultiLevelCacheEvictMessage request =
           deserializeInvalidationMessage(body, multiLevelCacheRedisTemplate);
 
-      if (request == null) return;
+      if (request == null) {
+        MultiLevelCacheMetrics.invalidationRejected(cacheManager.getMeterRegistry());
+        return;
+      }
 
       if (cacheManager.getInstanceId().equals(request.getSenderId())) return;
 
@@ -368,8 +367,11 @@ public class MultiLevelCacheAutoConfiguration {
 
       if (entryKey == null) cache.invalidateLocalCache();
       else cache.invalidateLocalEntry(entryKey);
+
+      cache.getMetrics().invalidationReceived();
     } catch (RuntimeException exception) {
       log.debug("Unknown Redis cache invalidation message", exception);
+      MultiLevelCacheMetrics.invalidationRejected(cacheManager.getMeterRegistry());
     }
   }
 

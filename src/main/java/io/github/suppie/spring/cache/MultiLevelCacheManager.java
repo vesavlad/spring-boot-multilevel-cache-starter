@@ -29,6 +29,9 @@ import static io.github.suppie.spring.cache.MultiLevelCacheConfigurationProperti
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.Expiry;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.binder.cache.CaffeineCacheMetrics;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.Collections;
@@ -58,12 +61,12 @@ public class MultiLevelCacheManager implements CacheManager {
   private final RedisTemplate<Object, Object> redisTemplate;
   private final CircuitBreaker circuitBreaker;
   private final String instanceId;
+  private final @Nullable MeterRegistry meterRegistry;
 
   private final Map<String, Cache> availableCaches;
 
   /**
-   * Creates a cache manager that produces multi-level caches backed by Redis with a local Caffeine
-   * tier.
+   * Creates a cache manager without metrics.
    *
    * @param highLevelProperties optional Spring cache properties for requested caches
    * @param properties multi-level cache configuration properties
@@ -75,6 +78,25 @@ public class MultiLevelCacheManager implements CacheManager {
       MultiLevelCacheConfigurationProperties properties,
       RedisTemplate<Object, Object> redisTemplate,
       CircuitBreaker circuitBreaker) {
+    this(highLevelProperties, properties, redisTemplate, circuitBreaker, null);
+  }
+
+  /**
+   * Creates a cache manager that produces multi-level caches backed by Redis with a local Caffeine
+   * tier, publishing per-cache meters when a registry is given.
+   *
+   * @param highLevelProperties optional Spring cache properties for requested caches
+   * @param properties multi-level cache configuration properties
+   * @param redisTemplate Redis template used for remote cache access and messaging
+   * @param circuitBreaker circuit breaker protecting Redis access
+   * @param meterRegistry registry for cache meters, or {@code null} to record none
+   */
+  public MultiLevelCacheManager(
+      ObjectProvider<@NonNull CacheProperties> highLevelProperties,
+      MultiLevelCacheConfigurationProperties properties,
+      RedisTemplate<Object, Object> redisTemplate,
+      CircuitBreaker circuitBreaker,
+      @Nullable MeterRegistry meterRegistry) {
     CacheProperties hlp = highLevelProperties.getIfAvailable();
     this.requestedCacheNames =
         hlp == null ? Collections.emptySet() : Set.copyOf(hlp.getCacheNames());
@@ -83,6 +105,7 @@ public class MultiLevelCacheManager implements CacheManager {
     this.redisTemplate = redisTemplate;
     this.circuitBreaker = circuitBreaker;
     this.instanceId = UUID.randomUUID().toString();
+    this.meterRegistry = meterRegistry;
 
     this.availableCaches = new ConcurrentHashMap<>();
 
@@ -106,6 +129,11 @@ public class MultiLevelCacheManager implements CacheManager {
     return instanceId;
   }
 
+  /** Returns the registry receiving cache meters, or {@code null} when metrics are off. */
+  @Nullable MeterRegistry getMeterRegistry() {
+    return meterRegistry;
+  }
+
   /**
    * Gets or creates the cache associated with the given name.
    *
@@ -122,16 +150,18 @@ public class MultiLevelCacheManager implements CacheManager {
     return availableCaches.computeIfAbsent(name, this::createCache);
   }
 
-  /** Creates a cache from its resolved settings. */
+  /** Creates a cache from its resolved settings and registers its meters. */
   private Cache createCache(@NonNull String name) {
     MultiLevelCacheConfigurationProperties cacheProperties = properties.forCache(name);
+    com.github.benmanes.caffeine.cache.Cache<@NonNull Object, Object> localCache =
+        localCacheBuilder(name, cacheProperties).build();
+    MultiLevelCacheMetrics metrics = MultiLevelCacheMetrics.NOOP;
+    if (meterRegistry != null) {
+      metrics = MultiLevelCacheMetrics.create(meterRegistry, name);
+      CaffeineCacheMetrics.monitor(meterRegistry, localCache, name, Tags.of("tier", "local"));
+    }
     return new MultiLevelCache(
-        name,
-        cacheProperties,
-        redisTemplate,
-        localCacheBuilder(name, cacheProperties).build(),
-        circuitBreaker,
-        instanceId);
+        name, cacheProperties, redisTemplate, localCache, circuitBreaker, instanceId, metrics);
   }
 
   /** Configures the local tier for one cache, naming the cache when its settings are invalid. */
@@ -139,6 +169,7 @@ public class MultiLevelCacheManager implements CacheManager {
       @NonNull String name, MultiLevelCacheConfigurationProperties cacheProperties) {
     try {
       return Caffeine.newBuilder()
+          .recordStats()
           .maximumSize(cacheProperties.getLocal().getMaxSize())
           .expireAfter(new RandomizedLocalExpiry(cacheProperties));
     } catch (IllegalArgumentException exception) {

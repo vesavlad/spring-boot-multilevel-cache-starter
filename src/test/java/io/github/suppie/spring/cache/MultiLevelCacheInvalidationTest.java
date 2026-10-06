@@ -11,6 +11,8 @@ import static org.mockito.Mockito.when;
 
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.Arrays;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -149,6 +151,87 @@ class MultiLevelCacheInvalidationTest {
     byte[] expectedLegacyBody =
         legacySerializer.serialize(new MultiLevelCacheEvictMessage("cache", "key", "instance"));
     assertThat(bodies.getAllValues()).anyMatch(body -> Arrays.equals(body, expectedLegacyBody));
+  }
+
+  @Test
+  void managerBindsMetersForLazilyCreatedCache() {
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    MultiLevelCacheManager manager = manager(listenerTemplate(), registry);
+
+    MultiLevelCache cache = (MultiLevelCache) manager.getCache("lazy");
+
+    assertThat(cache.getLocalCache().policy().isRecordingStats()).isTrue();
+    assertThat(registry.find("cache.size").tags("cache", "lazy", "tier", "local").gauge())
+        .isNotNull();
+    assertThat(
+            registry
+                .find("cache.multilevel.gets")
+                .tags("cache", "lazy", "result", "miss")
+                .counter())
+        .isNotNull();
+  }
+
+  @Test
+  void managerWithoutRegistryUsesNoopMetrics() {
+    MultiLevelCacheManager manager = manager(listenerTemplate());
+
+    MultiLevelCache cache = (MultiLevelCache) manager.getCache("plain");
+
+    assertThat(cache.getMetrics()).isSameAs(MultiLevelCacheMetrics.NOOP);
+  }
+
+  @Test
+  void inboundInvalidationFromAnotherInstanceIsCounted() {
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    RedisTemplate<Object, Object> template = listenerTemplate();
+    MultiLevelCacheManager manager = manager(template, registry);
+    manager.getCache("known");
+    var listener = MultiLevelCacheAutoConfiguration.createMessageListener(template, manager);
+
+    listener.onMessage(
+        new DefaultMessage(
+            "topic".getBytes(),
+            CacheInvalidationCodec.serialize(
+                new MultiLevelCacheEvictMessage("known", "key", "other-instance"))),
+        null);
+    listener.onMessage(
+        new DefaultMessage(
+            "topic".getBytes(),
+            CacheInvalidationCodec.serialize(
+                new MultiLevelCacheEvictMessage("known", "key", manager.getInstanceId()))),
+        null);
+
+    assertThat(
+            registry
+                .get("cache.multilevel.invalidations")
+                .tags("cache", "known", "direction", "received")
+                .counter()
+                .count())
+        .isEqualTo(1d);
+  }
+
+  @Test
+  void undecodableInvalidationIsCountedAsRejected() {
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    RedisTemplate<Object, Object> template = listenerTemplate();
+    MultiLevelCacheManager manager = manager(template, registry);
+
+    MultiLevelCacheAutoConfiguration.createMessageListener(template, manager)
+        .onMessage(new DefaultMessage("topic".getBytes(), "not-json".getBytes()), null);
+
+    assertThat(registry.get("cache.multilevel.invalidations.rejected").counter().count())
+        .isEqualTo(1d);
+  }
+
+  private static MultiLevelCacheManager manager(
+      RedisTemplate<Object, Object> template, MeterRegistry registry) {
+    ObjectProvider<CacheProperties> cacheProperties = mock(ObjectProvider.class);
+    return new MultiLevelCacheManager(
+        cacheProperties,
+        new MultiLevelCacheConfigurationProperties(),
+        template,
+        CircuitBreaker.ofDefaults("listener"),
+        registry);
   }
 
   private static RedisTemplate<Object, Object> listenerTemplate() {

@@ -126,6 +126,42 @@ configured Redis serializer.
 15-45m
 ```
 
+## Metrics
+
+When the application has a Micrometer `MeterRegistry` (for example via
+`spring-boot-starter-actuator`), the starter publishes these meters. Every cache gets them when it
+is created, including caches created on first use.
+
+| Meter                                            | Type     | Tags                                                                                  | Meaning                                                                                                     |
+|--------------------------------------------------|----------|---------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| `cache.multilevel.gets`                          | counter  | `cache`, `result` = `local_hit` \| `remote_hit` \| `miss`                             | One per read, by the tier that served it; use this for hit ratios                                           |
+| `cache.multilevel.redis.calls`                   | timer    | `cache`, `operation`, `outcome` = `success` \| `unavailable` \| `rejected` \| `error` | Redis latency; `unavailable` and `rejected` (breaker open) are fallbacks to the local tier                  |
+| `cache.multilevel.invalidations`                 | counter  | `cache`, `direction` = `sent` \| `received`                                           | Invalidation messages published, and received from other instances                                          |
+| `cache.multilevel.invalidations.rejected`        | counter  |                                                                                       | Inbound invalidation messages that could not be processed                                                   |
+| `cache.size`, `cache.evictions`, `cache.gets`, … | Caffeine | `cache`, `tier=local`                                                                 | Local tier size and evictions; its hit/miss counts include internal re-checks                               |
+| `resilience4j.circuitbreaker.*`                  | various  | `name=multiLevelCacheCircuitBreaker`                                                  | Redis breaker state, call outcomes, failure and slow-call rates (only when the starter creates the breaker) |
+
+Example Prometheus queries:
+
+```promql
+# Hit ratio per cache (either tier)
+sum by (cache) (rate(cache_multilevel_gets_total{result=~"local_hit|remote_hit"}[5m]))
+  / sum by (cache) (rate(cache_multilevel_gets_total[5m]))
+
+# Operations falling back to the local tier
+sum by (cache) (rate(cache_multilevel_redis_calls_seconds_count{outcome=~"unavailable|rejected"}[5m]))
+
+# Breaker open
+resilience4j_circuitbreaker_state{name="multiLevelCacheCircuitBreaker",state="open"} == 1
+```
+
+If you define your own `MultiLevelCacheManager` bean, declare its return type as
+`MultiLevelCacheManager` and pass the `MeterRegistry` to its constructor to get these meters.
+
+Disable with Spring Boot meter filters, e.g. `management.metrics.enable.cache.multilevel=false` or
+`management.metrics.enable.resilience4j=false`. Enable latency histograms with
+`management.metrics.distribution.percentiles-histogram.cache.multilevel.redis.calls=true`.
+
 ## Configuration options
 
 | Property                                                      | Default                  | Notes                                                                                               |

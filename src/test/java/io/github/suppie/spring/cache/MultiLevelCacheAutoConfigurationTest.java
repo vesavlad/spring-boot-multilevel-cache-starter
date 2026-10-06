@@ -25,6 +25,8 @@
 package io.github.suppie.spring.cache;
 
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.Arrays;
 import java.util.stream.Stream;
 import org.assertj.core.api.Assertions;
@@ -34,14 +36,19 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.autoconfigure.cache.CacheType;
 import org.springframework.boot.cache.autoconfigure.CacheAutoConfiguration;
+import org.springframework.boot.cache.autoconfigure.CacheProperties;
+import org.springframework.boot.cache.autoconfigure.metrics.CacheMetricsAutoConfiguration;
 import org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
 import org.springframework.data.redis.serializer.GenericJacksonJsonRedisSerializer;
@@ -56,6 +63,7 @@ class MultiLevelCacheAutoConfigurationTest extends AbstractRedisIntegrationTest 
           .withConfiguration(
               AutoConfigurations.of(
                   MultiLevelCacheAutoConfiguration.class,
+                  MultiLevelCacheMetricsAutoConfiguration.class,
                   DataRedisAutoConfiguration.class,
                   CacheAutoConfiguration.class));
 
@@ -399,5 +407,187 @@ class MultiLevelCacheAutoConfigurationTest extends AbstractRedisIntegrationTest 
                     .isEqualTo(CircuitBreaker.State.DISABLED));
 
     Assertions.assertThat(output).doesNotContain("Cache circuit breaker wait duration");
+  }
+
+  @Test
+  void breakerAndEagerCachesAreMeteredWithoutBootNameTag() {
+    runner
+        .withConfiguration(AutoConfigurations.of(CacheMetricsAutoConfiguration.class))
+        .withBean(SimpleMeterRegistry.class)
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .withPropertyValues("spring.cache.cache-names=eager")
+        .run(
+            context -> {
+              MeterRegistry registry = context.getBean(MeterRegistry.class);
+
+              Assertions.assertThat(
+                      registry
+                          .find("resilience4j.circuitbreaker.state")
+                          .tag("name", MultiLevelCacheAutoConfiguration.CIRCUIT_BREAKER_NAME)
+                          .gauges())
+                  .isNotEmpty();
+              Assertions.assertThat(
+                      registry.find("cache.size").tags("cache", "eager", "tier", "local").gauge())
+                  .isNotNull();
+              Assertions.assertThat(registry.getMeters())
+                  .noneMatch(
+                      meter ->
+                          meter.getId().getName().startsWith("cache.")
+                              && meter.getId().getTag("name") != null);
+            });
+  }
+
+  @Test
+  void lazilyCreatedCacheIsMetered() {
+    runner
+        .withConfiguration(AutoConfigurations.of(CacheMetricsAutoConfiguration.class))
+        .withBean(SimpleMeterRegistry.class)
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .run(
+            context -> {
+              MeterRegistry registry = context.getBean(MeterRegistry.class);
+              MultiLevelCacheManager cacheManager = context.getBean(MultiLevelCacheManager.class);
+
+              Assertions.assertThat(cacheManager.getCache("lazy").get("metrics-missing-key"))
+                  .isNull();
+
+              Assertions.assertThat(
+                      registry
+                          .get("cache.multilevel.gets")
+                          .tags("cache", "lazy", "result", "miss")
+                          .counter()
+                          .count())
+                  .isEqualTo(1d);
+            });
+  }
+
+  @Test
+  void userSuppliedBreakerIsNotMetered() {
+    runner
+        .withBean(SimpleMeterRegistry.class)
+        .withBean(
+            MultiLevelCacheAutoConfiguration.CIRCUIT_BREAKER_NAME,
+            CircuitBreaker.class,
+            () -> CircuitBreaker.ofDefaults("user"))
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .run(
+            context ->
+                Assertions.assertThat(
+                        context
+                            .getBean(MeterRegistry.class)
+                            .find("resilience4j.circuitbreaker.state")
+                            .gauges())
+                    .isEmpty());
+  }
+
+  @Test
+  void cachesWorkWithoutMeterRegistry() {
+    runner
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase())
+        .run(
+            context -> {
+              Assertions.assertThat(context).doesNotHaveBean(MeterRegistry.class);
+              MultiLevelCacheManager cacheManager = context.getBean(MultiLevelCacheManager.class);
+              var cache = cacheManager.getCache("no-registry");
+              cache.put("key", "value");
+              Assertions.assertThat(cache.get("key").get()).isEqualTo("value");
+              cache.evict("key");
+            });
+  }
+
+  private ApplicationContextRunner handWiredRunner() {
+    return new ApplicationContextRunner()
+        .withConfiguration(
+            AutoConfigurations.of(
+                MultiLevelCacheAutoConfiguration.class,
+                MultiLevelCacheMetricsAutoConfiguration.class,
+                DataRedisAutoConfiguration.class,
+                CacheAutoConfiguration.class,
+                CacheMetricsAutoConfiguration.class))
+        .withBean(SimpleMeterRegistry.class)
+        .withPropertyValues("spring.data.redis.host=" + System.getProperty("HOST"))
+        .withPropertyValues("spring.data.redis.port=" + System.getProperty("PORT"))
+        .withPropertyValues("spring.cache.type=" + CacheType.REDIS.name().toLowerCase());
+  }
+
+  @Test
+  void handWiredManagerWithRegistryIsNotBoundTwiceByBoot() {
+    handWiredRunner()
+        .withUserConfiguration(HandWiredMeteredManagerConfiguration.class)
+        .run(
+            context -> {
+              Assertions.assertThat(context).hasSingleBean(MultiLevelCacheManager.class);
+              MeterRegistry registry = context.getBean(MeterRegistry.class);
+              Assertions.assertThat(
+                      registry.find("cache.size").tags("cache", "eager", "tier", "local").gauge())
+                  .isNotNull();
+              Assertions.assertThat(registry.getMeters())
+                  .noneMatch(
+                      meter ->
+                          meter.getId().getName().startsWith("cache.")
+                              && meter.getId().getTag("name") != null);
+            });
+  }
+
+  @Test
+  void handWiredManagerWithoutRegistryKeepsBootBindingOfLocalTier() {
+    handWiredRunner()
+        .withUserConfiguration(HandWiredUnmeteredManagerConfiguration.class)
+        .run(
+            context -> {
+              MeterRegistry registry = context.getBean(MeterRegistry.class);
+              Assertions.assertThat(
+                      registry.find("cache.size").tags("cache", "eager", "name", "eager").gauge())
+                  .isNotNull();
+            });
+  }
+
+  private static MultiLevelCacheManager handWiredManager(
+      ObjectProvider<@NonNull CacheProperties> cacheProperties,
+      RedisConnectionFactory connectionFactory,
+      MeterRegistry meterRegistry) {
+    RedisTemplate<Object, Object> template = new RedisTemplate<>();
+    template.setConnectionFactory(connectionFactory);
+    template.setKeySerializer(new StringRedisSerializer());
+    template.setValueSerializer(RedisSerializer.json());
+    template.afterPropertiesSet();
+    MultiLevelCacheManager manager =
+        new MultiLevelCacheManager(
+            cacheProperties,
+            new MultiLevelCacheConfigurationProperties(),
+            template,
+            CircuitBreaker.ofDefaults("hand-wired"),
+            meterRegistry);
+    manager.getCache("eager");
+    return manager;
+  }
+
+  @Configuration(proxyBeanMethods = false)
+  static class HandWiredMeteredManagerConfiguration {
+    @Bean
+    MultiLevelCacheManager cacheManager(
+        ObjectProvider<@NonNull CacheProperties> cacheProperties,
+        RedisConnectionFactory connectionFactory,
+        MeterRegistry meterRegistry) {
+      return handWiredManager(cacheProperties, connectionFactory, meterRegistry);
+    }
+  }
+
+  @Configuration(proxyBeanMethods = false)
+  static class HandWiredUnmeteredManagerConfiguration {
+    @Bean
+    MultiLevelCacheManager cacheManager(
+        ObjectProvider<@NonNull CacheProperties> cacheProperties,
+        RedisConnectionFactory connectionFactory) {
+      return handWiredManager(cacheProperties, connectionFactory, null);
+    }
   }
 }
