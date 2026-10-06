@@ -9,10 +9,12 @@ spring:
     type: redis
     cache-names: products
     multilevel:
-      time-to-live: 5s
+      time-to-live: 60s
+      cache-null-values: true
       local:
         max-size: 2000
         expiry-jitter: 40
+        time-to-live: 30s
   data:
     redis:
       host: ${REDIS_HOST:localhost}

@@ -39,6 +39,10 @@ public class ProductService {
       throw new IllegalStateException("Interrupted while loading product", ex);
     }
 
+    if (id.startsWith("null")) {
+      return null;
+    }
+
     return database.computeIfAbsent(id, key -> new Product(key, "Gadget " + key, Instant.now()));
   }
 
